@@ -124,9 +124,10 @@ type Conn struct {
 
 	// File handle for kernel communication. Only safe to access if
 	// rio or wio is held.
-	dev *os.File
-	wio sync.RWMutex
-	rio sync.RWMutex
+	dev     *os.File
+	wio     sync.RWMutex
+	rio     sync.Mutex
+	readbuf []byte // large buffer for reading kernel requests; guarded by rio
 
 	// Protocol version negotiated with InitRequest/InitResponse.
 	proto Protocol
@@ -166,7 +167,8 @@ func Mount(dir string, options ...MountOption) (*Conn, error) {
 
 	ready := make(chan struct{}, 1)
 	c := &Conn{
-		Ready: ready,
+		Ready:   ready,
+		readbuf: make([]byte, maxBufSize),
 	}
 	f, err := mount(dir, &conf, ready, &c.MountError)
 	if err != nil {
@@ -291,8 +293,8 @@ type Header struct {
 	Gid  uint32    // group ID of process making request
 	Pid  uint32    // process ID of process making request
 
-	// for returning to reqPool
-	msg *message
+	msg *message  // for returning to reqPool
+	buf [160]byte // pre-allocated buffer for response; 160 bytes is enough to handle most responses
 }
 
 func (h *Header) String() string {
@@ -305,6 +307,14 @@ func (h *Header) Hdr() *Header {
 
 func (h *Header) noResponse() {
 	putMessage(h.msg)
+}
+
+func (h *Header) newBuffer(extra uintptr) buffer {
+	const hdrSize = unsafe.Sizeof(outHeader{})
+	if int(hdrSize+extra) < len(h.buf) {
+		return buffer(h.buf[:hdrSize : hdrSize+extra])
+	}
+	return make(buffer, hdrSize, hdrSize+extra)
 }
 
 func (h *Header) respond(msg []byte) {
@@ -397,7 +407,7 @@ func (h *Header) RespondError(err error) {
 	}
 	// FUSE uses negative errors!
 	// TODO: File bug report against OSXFUSE: positive error causes kernel panic.
-	buf := newBuffer(0)
+	buf := h.newBuffer(0)
 	hOut := (*outHeader)(unsafe.Pointer(&buf[0]))
 	hOut.Error = -int32(errno)
 	h.respond(buf)
@@ -406,7 +416,9 @@ func (h *Header) RespondError(err error) {
 // All requests read from the kernel, without data, are shorter than
 // this.
 var maxRequestSize = syscall.Getpagesize()
-var bufSize = maxRequestSize + maxWrite
+var maxBufSize = maxRequestSize + maxWrite
+
+const bufSize = 128 // 128 bytes is enough for the vast majority of messages.
 
 // reqPool is a pool of messages.
 //
@@ -420,10 +432,14 @@ var reqPool = sync.Pool{
 	New: allocMessage,
 }
 
-func allocMessage() interface{} {
-	m := &message{buf: make([]byte, bufSize)}
+func makeMessage(n int) *message {
+	m := &message{buf: make([]byte, n)}
 	m.hdr = (*inHeader)(unsafe.Pointer(&m.buf[0]))
 	return m
+}
+
+func allocMessage() interface{} {
+	return makeMessage(bufSize)
 }
 
 func getMessage(c *Conn) *message {
@@ -433,6 +449,12 @@ func getMessage(c *Conn) *message {
 }
 
 func putMessage(m *message) {
+	// Don't save messages with giant buffers.
+	// It just creates memory pressure, which triggers GC activity,
+	// which then empties the sync.Pool.
+	if cap(m.buf) < bufSize || cap(m.buf) > bufSize*2 {
+		return
+	}
 	m.buf = m.buf[:bufSize]
 	m.conn = nil
 	m.off = 0
@@ -546,16 +568,28 @@ func (c *Conn) Protocol() Protocol {
 // Caller must call either Request.Respond or Request.RespondError in
 // a reasonable time. Caller must not retain Request after that call.
 func (c *Conn) ReadRequest() (Request, error) {
-	m := getMessage(c)
-loop:
-	c.rio.RLock()
-	n, err := syscall.Read(c.fd(), m.buf)
-	c.rio.RUnlock()
-	if err == syscall.EINTR {
-		// OSXFUSE sends EINTR to userspace when a request interrupt
-		// completed before it got sent to userspace?
-		goto loop
+	var m *message
+	var n int
+	var err error
+	c.rio.Lock()
+	for m == nil {
+		n, err = syscall.Read(c.fd(), c.readbuf)
+		if err == syscall.EINTR {
+			// OSXFUSE sends EINTR to userspace when a request interrupt
+			// completed before it got sent to userspace?
+			continue
+		}
+		if n <= bufSize {
+			m = getMessage(c)
+		} else {
+			m = makeMessage(n)
+			m.conn = c
+		}
+		if n > 0 {
+			copy(m.buf, c.readbuf[:n])
+		}
 	}
+	c.rio.Unlock()
 	if err != nil && err != syscall.ENODEV {
 		putMessage(m)
 		return nil, err
@@ -596,7 +630,9 @@ loop:
 	var req Request
 	switch m.hdr.Opcode {
 	default:
-		Debug(noOpcode{Opcode: m.hdr.Opcode})
+		if Debug != nil {
+			Debug(noOpcode{Opcode: m.hdr.Opcode})
+		}
 		goto unrecognized
 
 	case opLookup:
@@ -1049,7 +1085,9 @@ loop:
 	return req, nil
 
 corrupt:
-	Debug(malformedMessage{})
+	if Debug != nil {
+		Debug(malformedMessage{})
+	}
 	putMessage(m)
 	return nil, fmt.Errorf("fuse: malformed message")
 
@@ -1095,7 +1133,7 @@ func (c *Conn) writeToKernel(msg []byte) error {
 	c.wio.RLock()
 	defer c.wio.RUnlock()
 	nn, err := syscall.Write(c.fd(), msg)
-	if err == nil && nn != len(msg) {
+	if err == nil && nn != len(msg) && Debug != nil {
 		Debug(bugShortKernelWrite{
 			Written: int64(nn),
 			Length:  int64(len(msg)),
@@ -1107,7 +1145,7 @@ func (c *Conn) writeToKernel(msg []byte) error {
 }
 
 func (c *Conn) respond(msg []byte) {
-	if err := c.writeToKernel(msg); err != nil {
+	if err := c.writeToKernel(msg); err != nil && Debug != nil {
 		Debug(bugKernelWriteError{
 			Error: errorString(err),
 			Stack: stack(),
@@ -1226,7 +1264,7 @@ func (r *InitResponse) String() string {
 
 // Respond replies to the request with the given response.
 func (r *InitRequest) Respond(resp *InitResponse) {
-	buf := newBuffer(unsafe.Sizeof(initOut{}))
+	buf := r.newBuffer(unsafe.Sizeof(initOut{}))
 	out := (*initOut)(buf.alloc(unsafe.Sizeof(initOut{})))
 	out.Major = resp.Library.Major
 	out.Minor = resp.Library.Minor
@@ -1255,7 +1293,7 @@ func (r *StatfsRequest) String() string {
 
 // Respond replies to the request with the given response.
 func (r *StatfsRequest) Respond(resp *StatfsResponse) {
-	buf := newBuffer(unsafe.Sizeof(statfsOut{}))
+	buf := r.newBuffer(unsafe.Sizeof(statfsOut{}))
 	out := (*statfsOut)(buf.alloc(unsafe.Sizeof(statfsOut{})))
 	out.St = kstatfs{
 		Blocks:  resp.Blocks,
@@ -1307,7 +1345,7 @@ func (r *AccessRequest) String() string {
 // Respond replies to the request indicating that access is allowed.
 // To deny access, use RespondError.
 func (r *AccessRequest) Respond() {
-	buf := newBuffer(0)
+	buf := r.newBuffer(0)
 	r.respond(buf)
 }
 
@@ -1403,7 +1441,7 @@ func (r *GetattrRequest) String() string {
 // Respond replies to the request with the given response.
 func (r *GetattrRequest) Respond(resp *GetattrResponse) {
 	size := attrOutSize(r.Header.Conn.proto)
-	buf := newBuffer(size)
+	buf := r.newBuffer(size)
 	out := (*attrOut)(buf.alloc(size))
 	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
 	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
@@ -1446,12 +1484,12 @@ func (r *GetxattrRequest) String() string {
 // Respond replies to the request with the given response.
 func (r *GetxattrRequest) Respond(resp *GetxattrResponse) {
 	if r.Size == 0 {
-		buf := newBuffer(unsafe.Sizeof(getxattrOut{}))
+		buf := r.newBuffer(unsafe.Sizeof(getxattrOut{}))
 		out := (*getxattrOut)(buf.alloc(unsafe.Sizeof(getxattrOut{})))
 		out.Size = uint32(len(resp.Xattr))
 		r.respond(buf)
 	} else {
-		buf := newBuffer(uintptr(len(resp.Xattr)))
+		buf := r.newBuffer(uintptr(len(resp.Xattr)))
 		buf = append(buf, resp.Xattr...)
 		r.respond(buf)
 	}
@@ -1482,12 +1520,12 @@ func (r *ListxattrRequest) String() string {
 // Respond replies to the request with the given response.
 func (r *ListxattrRequest) Respond(resp *ListxattrResponse) {
 	if r.Size == 0 {
-		buf := newBuffer(unsafe.Sizeof(getxattrOut{}))
+		buf := r.newBuffer(unsafe.Sizeof(getxattrOut{}))
 		out := (*getxattrOut)(buf.alloc(unsafe.Sizeof(getxattrOut{})))
 		out.Size = uint32(len(resp.Xattr))
 		r.respond(buf)
 	} else {
-		buf := newBuffer(uintptr(len(resp.Xattr)))
+		buf := r.newBuffer(uintptr(len(resp.Xattr)))
 		buf = append(buf, resp.Xattr...)
 		r.respond(buf)
 	}
@@ -1524,7 +1562,7 @@ func (r *RemovexattrRequest) String() string {
 
 // Respond replies to the request, indicating that the attribute was removed.
 func (r *RemovexattrRequest) Respond() {
-	buf := newBuffer(0)
+	buf := r.newBuffer(0)
 	r.respond(buf)
 }
 
@@ -1569,7 +1607,7 @@ func (r *SetxattrRequest) String() string {
 
 // Respond replies to the request, indicating that the extended attribute was set.
 func (r *SetxattrRequest) Respond() {
-	buf := newBuffer(0)
+	buf := r.newBuffer(0)
 	r.respond(buf)
 }
 
@@ -1588,7 +1626,7 @@ func (r *LookupRequest) String() string {
 // Respond replies to the request with the given response.
 func (r *LookupRequest) Respond(resp *LookupResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
-	buf := newBuffer(size)
+	buf := r.newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
 	out.Nodeid = uint64(resp.Node)
 	out.Generation = resp.Generation
@@ -1631,7 +1669,7 @@ func (r *OpenRequest) String() string {
 
 // Respond replies to the request with the given response.
 func (r *OpenRequest) Respond(resp *OpenResponse) {
-	buf := newBuffer(unsafe.Sizeof(openOut{}))
+	buf := r.newBuffer(unsafe.Sizeof(openOut{}))
 	out := (*openOut)(buf.alloc(unsafe.Sizeof(openOut{})))
 	out.Fh = uint64(resp.Handle)
 	out.OpenFlags = uint32(resp.Flags)
@@ -1671,7 +1709,7 @@ func (r *CreateRequest) String() string {
 // Respond replies to the request with the given response.
 func (r *CreateRequest) Respond(resp *CreateResponse) {
 	eSize := entryOutSize(r.Header.Conn.proto)
-	buf := newBuffer(eSize + unsafe.Sizeof(openOut{}))
+	buf := r.newBuffer(eSize + unsafe.Sizeof(openOut{}))
 
 	e := (*entryOut)(buf.alloc(eSize))
 	e.Nodeid = uint64(resp.Node)
@@ -1718,7 +1756,7 @@ func (r *MkdirRequest) String() string {
 // Respond replies to the request with the given response.
 func (r *MkdirRequest) Respond(resp *MkdirResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
-	buf := newBuffer(size)
+	buf := r.newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
 	out.Nodeid = uint64(resp.Node)
 	out.Generation = resp.Generation
@@ -1759,7 +1797,7 @@ func (r *ReadRequest) String() string {
 
 // Respond replies to the request with the given response.
 func (r *ReadRequest) Respond(resp *ReadResponse) {
-	buf := newBuffer(uintptr(len(resp.Data)))
+	buf := r.newBuffer(uintptr(len(resp.Data)))
 	buf = append(buf, resp.Data...)
 	r.respond(buf)
 }
@@ -1802,7 +1840,7 @@ func (r *ReleaseRequest) String() string {
 
 // Respond replies to the request, indicating that the handle has been released.
 func (r *ReleaseRequest) Respond() {
-	buf := newBuffer(0)
+	buf := r.newBuffer(0)
 	r.respond(buf)
 }
 
@@ -1821,7 +1859,7 @@ func (r *DestroyRequest) String() string {
 
 // Respond replies to the request.
 func (r *DestroyRequest) Respond() {
-	buf := newBuffer(0)
+	buf := r.newBuffer(0)
 	r.respond(buf)
 }
 
@@ -1961,7 +1999,7 @@ func (r *WriteRequest) MarshalJSON() ([]byte, error) {
 
 // Respond replies to the request with the given response.
 func (r *WriteRequest) Respond(resp *WriteResponse) {
-	buf := newBuffer(unsafe.Sizeof(writeOut{}))
+	buf := r.newBuffer(unsafe.Sizeof(writeOut{}))
 	out := (*writeOut)(buf.alloc(unsafe.Sizeof(writeOut{})))
 	out.Size = uint32(resp.Size)
 	r.respond(buf)
@@ -2052,7 +2090,7 @@ func (r *SetattrRequest) String() string {
 // giving the updated attributes.
 func (r *SetattrRequest) Respond(resp *SetattrResponse) {
 	size := attrOutSize(r.Header.Conn.proto)
-	buf := newBuffer(size)
+	buf := r.newBuffer(size)
 	out := (*attrOut)(buf.alloc(size))
 	out.AttrValid = uint64(resp.Attr.Valid / time.Second)
 	out.AttrValidNsec = uint32(resp.Attr.Valid % time.Second / time.Nanosecond)
@@ -2087,7 +2125,7 @@ func (r *FlushRequest) String() string {
 
 // Respond replies to the request, indicating that the flush succeeded.
 func (r *FlushRequest) Respond() {
-	buf := newBuffer(0)
+	buf := r.newBuffer(0)
 	r.respond(buf)
 }
 
@@ -2107,7 +2145,7 @@ func (r *RemoveRequest) String() string {
 
 // Respond replies to the request, indicating that the file was removed.
 func (r *RemoveRequest) Respond() {
-	buf := newBuffer(0)
+	buf := r.newBuffer(0)
 	r.respond(buf)
 }
 
@@ -2126,7 +2164,7 @@ func (r *SymlinkRequest) String() string {
 // Respond replies to the request, indicating that the symlink was created.
 func (r *SymlinkRequest) Respond(resp *SymlinkResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
-	buf := newBuffer(size)
+	buf := r.newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
 	out.Nodeid = uint64(resp.Node)
 	out.Generation = resp.Generation
@@ -2159,7 +2197,7 @@ func (r *ReadlinkRequest) String() string {
 }
 
 func (r *ReadlinkRequest) Respond(target string) {
-	buf := newBuffer(uintptr(len(target)))
+	buf := r.newBuffer(uintptr(len(target)))
 	buf = append(buf, target...)
 	r.respond(buf)
 }
@@ -2179,7 +2217,7 @@ func (r *LinkRequest) String() string {
 
 func (r *LinkRequest) Respond(resp *LookupResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
-	buf := newBuffer(size)
+	buf := r.newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
 	out.Nodeid = uint64(resp.Node)
 	out.Generation = resp.Generation
@@ -2205,7 +2243,7 @@ func (r *RenameRequest) String() string {
 }
 
 func (r *RenameRequest) Respond() {
-	buf := newBuffer(0)
+	buf := r.newBuffer(0)
 	r.respond(buf)
 }
 
@@ -2226,7 +2264,7 @@ func (r *MknodRequest) String() string {
 
 func (r *MknodRequest) Respond(resp *LookupResponse) {
 	size := entryOutSize(r.Header.Conn.proto)
-	buf := newBuffer(size)
+	buf := r.newBuffer(size)
 	out := (*entryOut)(buf.alloc(size))
 	out.Nodeid = uint64(resp.Node)
 	out.Generation = resp.Generation
@@ -2253,7 +2291,7 @@ func (r *FsyncRequest) String() string {
 }
 
 func (r *FsyncRequest) Respond() {
-	buf := newBuffer(0)
+	buf := r.newBuffer(0)
 	r.respond(buf)
 }
 
@@ -2298,6 +2336,6 @@ func (r *ExchangeDataRequest) String() string {
 }
 
 func (r *ExchangeDataRequest) Respond() {
-	buf := newBuffer(0)
+	buf := r.newBuffer(0)
 	r.respond(buf)
 }
