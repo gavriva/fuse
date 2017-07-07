@@ -10,7 +10,7 @@ import (
 )
 
 import (
-	"bazil.org/fuse"
+	"github.com/gavriva/fuse"
 )
 
 // A Tree implements a basic read-only directory tree for FUSE.

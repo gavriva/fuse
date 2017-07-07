@@ -1,8 +1,6 @@
-package fuseutil // import "bazil.org/fuse/fuseutil"
+package fuseutil
 
-import (
-	"bazil.org/fuse"
-)
+import "github.com/gavriva/fuse"
 
 // HandleRead handles a read request assuming that data is the entire file content.
 // It adjusts the amount returned in resp according to req.Offset and req.Size.

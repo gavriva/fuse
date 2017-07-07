@@ -8,9 +8,9 @@ import (
 	"path"
 	"testing"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
-	"bazil.org/fuse/fs/fstestutil"
+	"github.com/gavriva/fuse"
+	"github.com/gavriva/fuse/fs"
+	"github.com/gavriva/fuse/fs/fstestutil"
 )
 
 type benchConfig struct {

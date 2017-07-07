@@ -19,8 +19,8 @@ import (
 import (
 	"bytes"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fuseutil"
+	"github.com/gavriva/fuse"
+	"github.com/gavriva/fuse/fuseutil"
 )
 
 const (

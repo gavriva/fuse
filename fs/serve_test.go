@@ -17,12 +17,12 @@ import (
 	"testing"
 	"time"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
-	"bazil.org/fuse/fs/fstestutil"
-	"bazil.org/fuse/fs/fstestutil/record"
-	"bazil.org/fuse/fuseutil"
-	"bazil.org/fuse/syscallx"
+	"github.com/gavriva/fuse"
+	"github.com/gavriva/fuse/fs"
+	"github.com/gavriva/fuse/fs/fstestutil"
+	"github.com/gavriva/fuse/fs/fstestutil/record"
+	"github.com/gavriva/fuse/fuseutil"
+	"github.com/gavriva/fuse/syscallx"
 )
 
 // TO TEST:
