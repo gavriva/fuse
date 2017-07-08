@@ -1368,12 +1368,11 @@ func (c *Server) handleRequest(ctx context.Context, node Node, snode *serveNode,
 
 	case *fuse.FsyncRequest:
 		n, ok := node.(NodeFsyncer)
-		if !ok {
-			return fuse.EIO
-		}
-		err := n.Fsync(ctx, r)
-		if err != nil {
-			return err
+		if ok {
+			err := n.Fsync(ctx, r)
+			if err != nil {
+				return err
+			}
 		}
 		done(nil)
 		r.Respond()
